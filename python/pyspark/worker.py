@@ -913,6 +913,26 @@ def wrap_window_agg_pandas_udf(
         )
 
 
+def wrap_window_agg_arrow_udf(f, args_offsets, kwargs_offsets, return_type, runner_conf, udf_index):
+    window_bound_types_str = runner_conf.get("pandas_window_bound_types")
+    window_bound_type = [t.strip().lower() for t in window_bound_types_str.split(",")][udf_index]
+    if window_bound_type == "bounded":
+        return wrap_bounded_window_agg_arrow_udf(
+            f, args_offsets, kwargs_offsets, return_type, runner_conf
+        )
+    elif window_bound_type == "unbounded":
+        return wrap_unbounded_window_agg_arrow_udf(
+            f, args_offsets, kwargs_offsets, return_type, runner_conf
+        )
+    else:
+        raise PySparkRuntimeError(
+            errorClass="INVALID_WINDOW_BOUND_TYPE",
+            messageParameters={
+                "window_bound_type": window_bound_type,
+            },
+        )
+
+
 def wrap_unbounded_window_agg_pandas_udf(f, args_offsets, kwargs_offsets, return_type, runner_conf):
     func, args_kwargs_offsets = wrap_kwargs_support(f, args_offsets, kwargs_offsets)
 
@@ -929,6 +949,27 @@ def wrap_unbounded_window_agg_pandas_udf(f, args_offsets, kwargs_offsets, return
 
         result = func(*series)
         return pd.Series([result]).repeat(len(series[0]))
+
+    return (
+        args_kwargs_offsets,
+        lambda *a: (wrapped(*a), arrow_return_type),
+    )
+
+
+def wrap_unbounded_window_agg_arrow_udf(f, args_offsets, kwargs_offsets, return_type, runner_conf):
+    func, args_kwargs_offsets = wrap_kwargs_support(f, args_offsets, kwargs_offsets)
+
+    # This is similar to wrap_unbounded_window_agg_pandas_udf, the only difference
+    # is that this function is for arrow udf.
+    arrow_return_type = to_arrow_type(
+        return_type, prefers_large_types=use_large_var_types(runner_conf)
+    )
+
+    def wrapped(*series):
+        import pyarrow as pa
+
+        result = func(*series)
+        return pa.repeat(result, len(series[0]))
 
     return (
         args_kwargs_offsets,
@@ -973,6 +1014,35 @@ def wrap_bounded_window_agg_pandas_udf(f, args_offsets, kwargs_offsets, return_t
             series_slices = [s.iloc[begin_array[i] : end_array[i]] for s in series]
             result.append(func(*series_slices))
         return pd.Series(result)
+
+    return (
+        args_offsets[:2] + args_kwargs_offsets,
+        lambda *a: (wrapped(*a), arrow_return_type),
+    )
+
+
+def wrap_bounded_window_agg_arrow_udf(f, args_offsets, kwargs_offsets, return_type, runner_conf):
+    # args_offsets should have at least 2 for begin_index, end_index.
+    assert len(args_offsets) >= 2, len(args_offsets)
+    func, args_kwargs_offsets = wrap_kwargs_support(f, args_offsets[2:], kwargs_offsets)
+
+    arrow_return_type = to_arrow_type(
+        return_type, prefers_large_types=use_large_var_types(runner_conf)
+    )
+
+    def wrapped(begin_index, end_index, *series):
+        import pyarrow as pa
+
+        assert isinstance(begin_index, pa.Int32Array), type(begin_index)
+        assert isinstance(end_index, pa.Int32Array), type(end_index)
+
+        result = []
+        for i in range(len(begin_index)):
+            offset = begin_index[i].as_py()
+            length = end_index[i].as_py() - offset
+            series_slices = [s.slice(offset=offset, length=length) for s in series]
+            result.append(func(*series_slices))
+        return pa.array(result)
 
     return (
         args_offsets[:2] + args_kwargs_offsets,
@@ -1066,6 +1136,7 @@ def read_single_udf(pickleSer, infile, eval_type, runner_conf, udf_index, profil
         PythonEvalType.SQL_SCALAR_ARROW_UDF,
         PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
         PythonEvalType.SQL_WINDOW_AGG_PANDAS_UDF,
+        PythonEvalType.SQL_WINDOW_AGG_ARROW_UDF,
         # The below doesn't support named argument, but shares the same protocol.
         PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF,
         PythonEvalType.SQL_SCALAR_ARROW_ITER_UDF,
@@ -1174,6 +1245,10 @@ def read_single_udf(pickleSer, infile, eval_type, runner_conf, udf_index, profil
         return wrap_window_agg_pandas_udf(
             func, args_offsets, kwargs_offsets, return_type, runner_conf, udf_index
         )
+    elif eval_type == PythonEvalType.SQL_WINDOW_AGG_ARROW_UDF:
+        return wrap_window_agg_arrow_udf(
+            func, args_offsets, kwargs_offsets, return_type, runner_conf, udf_index
+        )
     elif eval_type == PythonEvalType.SQL_BATCHED_UDF:
         return wrap_udf(func, args_offsets, kwargs_offsets, return_type)
     else:
@@ -1238,8 +1313,16 @@ def read_udtf(pickleSer, infile, eval_type):
                 ).lower()
                 == "true"
             )
+            int_to_decimal_coercion_enabled = (
+                runner_conf.get(
+                    "spark.sql.execution.pythonUDF.pandas.intToDecimalCoercionEnabled", "false"
+                ).lower()
+                == "true"
+            )
             timezone = runner_conf.get("spark.sql.session.timeZone", None)
-            ser = ArrowStreamPandasUDTFSerializer(timezone, safecheck)
+            ser = ArrowStreamPandasUDTFSerializer(
+                timezone, safecheck, int_to_decimal_coercion_enabled=int_to_decimal_coercion_enabled
+            )
         else:
             ser = ArrowStreamUDTFSerializer()
 
@@ -1924,6 +2007,7 @@ def read_udfs(pickleSer, infile, eval_type):
         PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
         PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF,
         PythonEvalType.SQL_WINDOW_AGG_PANDAS_UDF,
+        PythonEvalType.SQL_WINDOW_AGG_ARROW_UDF,
         PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE,
         PythonEvalType.SQL_GROUPED_MAP_ARROW_UDF,
         PythonEvalType.SQL_COGROUPED_MAP_ARROW_UDF,
@@ -1960,12 +2044,23 @@ def read_udfs(pickleSer, infile, eval_type):
             runner_conf.get("spark.sql.execution.pandas.convertToArrowArraySafely", "false").lower()
             == "true"
         )
+        int_to_decimal_coercion_enabled = (
+            runner_conf.get(
+                "spark.sql.execution.pythonUDF.pandas.intToDecimalCoercionEnabled", "false"
+            ).lower()
+            == "true"
+        )
         _assign_cols_by_name = assign_cols_by_name(runner_conf)
 
         if eval_type == PythonEvalType.SQL_COGROUPED_MAP_ARROW_UDF:
             ser = CogroupArrowUDFSerializer(_assign_cols_by_name)
         elif eval_type == PythonEvalType.SQL_COGROUPED_MAP_PANDAS_UDF:
-            ser = CogroupPandasUDFSerializer(timezone, safecheck, _assign_cols_by_name)
+            ser = CogroupPandasUDFSerializer(
+                timezone,
+                safecheck,
+                _assign_cols_by_name,
+                int_to_decimal_coercion_enabled=int_to_decimal_coercion_enabled,
+            )
         elif eval_type == PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF_WITH_STATE:
             arrow_max_records_per_batch = runner_conf.get(
                 "spark.sql.execution.arrow.maxRecordsPerBatch", 10000
@@ -1979,6 +2074,7 @@ def read_udfs(pickleSer, infile, eval_type):
                 state_object_schema,
                 arrow_max_records_per_batch,
                 prefers_large_var_types,
+                int_to_decimal_coercion_enabled=int_to_decimal_coercion_enabled,
             )
         elif eval_type == PythonEvalType.SQL_TRANSFORM_WITH_STATE_PANDAS_UDF:
             arrow_max_records_per_batch = runner_conf.get(
@@ -1987,7 +2083,11 @@ def read_udfs(pickleSer, infile, eval_type):
             arrow_max_records_per_batch = int(arrow_max_records_per_batch)
 
             ser = TransformWithStateInPandasSerializer(
-                timezone, safecheck, _assign_cols_by_name, arrow_max_records_per_batch
+                timezone,
+                safecheck,
+                _assign_cols_by_name,
+                arrow_max_records_per_batch,
+                int_to_decimal_coercion_enabled=int_to_decimal_coercion_enabled,
             )
         elif eval_type == PythonEvalType.SQL_TRANSFORM_WITH_STATE_PANDAS_INIT_STATE_UDF:
             arrow_max_records_per_batch = runner_conf.get(
@@ -1996,7 +2096,11 @@ def read_udfs(pickleSer, infile, eval_type):
             arrow_max_records_per_batch = int(arrow_max_records_per_batch)
 
             ser = TransformWithStateInPandasInitStateSerializer(
-                timezone, safecheck, _assign_cols_by_name, arrow_max_records_per_batch
+                timezone,
+                safecheck,
+                _assign_cols_by_name,
+                arrow_max_records_per_batch,
+                int_to_decimal_coercion_enabled=int_to_decimal_coercion_enabled,
             )
         elif eval_type == PythonEvalType.SQL_TRANSFORM_WITH_STATE_PYTHON_ROW_UDF:
             arrow_max_records_per_batch = runner_conf.get(
@@ -2020,6 +2124,7 @@ def read_udfs(pickleSer, infile, eval_type):
             PythonEvalType.SQL_SCALAR_ARROW_UDF,
             PythonEvalType.SQL_SCALAR_ARROW_ITER_UDF,
             PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF,
+            PythonEvalType.SQL_WINDOW_AGG_ARROW_UDF,
         ):
             # Arrow cast for type coercion is disabled by default
             ser = ArrowStreamArrowUDFSerializer(timezone, safecheck, _assign_cols_by_name, False)
@@ -2062,6 +2167,7 @@ def read_udfs(pickleSer, infile, eval_type):
                 ndarray_as_list,
                 arrow_cast,
                 input_types,
+                int_to_decimal_coercion_enabled=int_to_decimal_coercion_enabled,
             )
     else:
         batch_size = int(os.environ.get("PYTHON_UDF_BATCH_SIZE", "100"))
